@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aether-runtime"
+version = "0.0.0"
+description = "Python bindings for the Aether Zig runtime."
+requires-python = ">=3.10"
+authors = [{ name = "Aether Contributors" }]
+readme = "../README.md"
+license = { text = "MIT" }
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
