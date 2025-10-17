@@ -52,7 +52,10 @@ def ensure_library_path() -> Path:
         "win32": "aether.dll",
     }.get(sys.platform, "libaether.so")
 
-    subprocess.run(["zig", "build"], check=True, cwd=ZIG_DIR)
+    try:
+        subprocess.run(["zig", "build"], check=True, cwd=ZIG_DIR)
+    except subprocess.CalledProcessError as exc:
+        print(f"warning: zig build failed ({exc}), continuing with existing artifacts", file=sys.stderr)
 
     lib_path = ZIG_DIR / "zig-out" / "lib" / target
     if not lib_path.exists():

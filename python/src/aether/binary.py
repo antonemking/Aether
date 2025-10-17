@@ -14,6 +14,31 @@ _HEADER = struct.Struct("<II")
 _CALL = struct.Struct("<HHxxxxQ")
 
 
+class PythonCall(ctypes.Structure):
+    _fields_ = [
+        ("tool_id", ctypes.c_uint16),
+        ("reserved", ctypes.c_uint16),
+        ("payload", ctypes.c_uint64),
+    ]
+
+
+class PythonResult(ctypes.Structure):
+    _fields_ = [
+        ("status", ctypes.c_uint16),
+        ("reserved", ctypes.c_uint16),
+        ("output", ctypes.c_uint64),
+        ("error_code", ctypes.c_int32),
+    ]
+
+
+ToolCallback = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.POINTER(PythonCall),
+    ctypes.POINTER(PythonResult),
+)
+
+
 class ResultBuffer(ctypes.Structure):
     _fields_ = [
         ("ptr", ctypes.POINTER(ctypes.c_uint8)),
@@ -64,9 +89,9 @@ def encode_calls(calls: Iterable[Mapping[str, int]]) -> EncodedBatch:
     for call in call_list:
         try:
             tool_id = int(call["tool_id"])
-            payload = int(call["payload"])
+            payload = int(call.get("payload", 0))
         except (KeyError, ValueError, TypeError) as exc:
-            raise ValueError("Each call must include integer 'tool_id' and 'payload'") from exc
+            raise ValueError("Each call must include integer 'tool_id' and numeric 'payload'") from exc
 
         _CALL.pack_into(buf, offset, tool_id, 0, payload)
         offset += _CALL.size
@@ -100,6 +125,9 @@ def decode_results(buffer: ResultBuffer) -> List[ToolExecution]:
 
 
 __all__ = [
+    "PythonCall",
+    "PythonResult",
+    "ToolCallback",
     "EncodedBatch",
     "ResultBuffer",
     "ToolExecution",

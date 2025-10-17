@@ -1,5 +1,4 @@
 const std = @import("std");
-const meta = std.meta;
 const mem = std.mem;
 
 const core = @import("core");
@@ -23,7 +22,7 @@ pub const FfiToolCall = extern struct {
 
 pub const FfiToolResult = extern struct {
     tool_id: u16,
-    status: u16, // 0 = ok, 1 = error
+    status: u16,
     output: u64,
     elapsed_ns: u64,
     error_code: i32,
@@ -32,8 +31,8 @@ pub const FfiToolResult = extern struct {
 
 pub const ResultBuffer = extern struct {
     ptr: ?[*]u8,
-    len: usize, // number of bytes in the buffer
-    count: usize, // number of FfiToolResult entries encoded in ptr
+    len: usize,
+    count: usize,
 };
 
 fn makeErrorBuffer(runtime: *core.Runtime, code: i32) ResultBuffer {
@@ -70,11 +69,11 @@ fn successBuffer(runtime: *core.Runtime, results: []core.ToolResult) !ResultBuff
 
     for (results, slice) |result, *dest| {
         dest.* = .{
-            .tool_id = @intFromEnum(result.tool_id),
-            .status = 0,
+            .tool_id = result.tool_id,
+            .status = result.status,
             .output = result.output,
             .elapsed_ns = result.elapsed_ns,
-            .error_code = 0,
+            .error_code = result.error_code,
             .reserved = 0,
         };
     }
@@ -84,14 +83,17 @@ fn successBuffer(runtime: *core.Runtime, results: []core.ToolResult) !ResultBuff
 
 fn mapExecutionError(err: anyerror) i32 {
     return switch (err) {
-        error.ToolNotRegistered => ERR_UNKNOWN_TOOL,
         error.InvalidPayload => ERR_INVALID_PAYLOAD,
+        error.ToolNotRegistered => ERR_UNKNOWN_TOOL,
         else => ERR_EXECUTION,
     };
 }
 
-export fn aether_create_runtime() callconv(.C) ?*core.Runtime {
-    return core.initRuntime(std.heap.c_allocator) catch null;
+export fn aether_create_runtime(
+    callback: core.PythonCallback,
+    context: ?*anyopaque,
+) callconv(.C) ?*core.Runtime {
+    return core.initRuntime(std.heap.c_allocator, callback, context) catch null;
 }
 
 export fn aether_destroy_runtime(runtime: ?*core.Runtime) callconv(.C) void {
@@ -130,12 +132,8 @@ export fn aether_execute(
     defer runtime.allocator.free(tool_calls);
 
     for (ffi_calls, tool_calls) |ffi_call, *tool_call| {
-        const tool_id = meta.intToEnum(core.ToolId, ffi_call.tool_id) catch {
-            return makeErrorBuffer(runtime, ERR_UNKNOWN_TOOL);
-        };
-
         tool_call.* = .{
-            .tool_id = tool_id,
+            .tool_id = ffi_call.tool_id,
             .payload = ffi_call.payload,
         };
     }
