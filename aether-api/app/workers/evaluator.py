@@ -11,13 +11,25 @@ This worker:
 import json
 import asyncio
 import sys
+import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from uuid import UUID
+from decimal import Decimal
 
 from app.core.database import SessionLocal
 from app.core.redis_client import get_redis
 from app.models import RAGTrace, Evaluation
+
+# RAGAS imports
+try:
+    from ragas.metrics import faithfulness
+    from ragas import evaluate
+    from datasets import Dataset
+    RAGAS_AVAILABLE = True
+except ImportError:
+    RAGAS_AVAILABLE = False
+    print("⚠️  RAGAS not available. Faithfulness scoring will be skipped.")
 
 
 async def process_evaluation_queue():
@@ -30,6 +42,13 @@ async def process_evaluation_queue():
     print("🚀 Aether Evaluation Worker Starting")
     print("=" * 70)
     print(f"Started at: {datetime.utcnow().isoformat()}")
+    print(f"RAGAS Available: {'✅ Yes' if RAGAS_AVAILABLE else '❌ No'}")
+    if RAGAS_AVAILABLE:
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+        if openai_key and openai_key != "your-openai-key":
+            print(f"OpenAI API Key: ✅ Configured")
+        else:
+            print(f"OpenAI API Key: ⚠️  Not configured (faithfulness will be skipped)")
     print("Waiting for evaluation jobs...")
     print()
 
@@ -104,6 +123,13 @@ async def process_evaluation_queue():
                 print(f"   ✅ Evaluation complete!")
                 print(f"      Token Overlap: {results.get('token_overlap_ratio', 0):.2%}")
                 print(f"      Answer Length: {results.get('answer_length')} words")
+
+                if results.get('faithfulness') is not None:
+                    print(f"      Faithfulness: {results.get('faithfulness'):.2f}")
+                    if results.get('hallucination_detected'):
+                        print(f"      ⚠️  HALLUCINATION DETECTED (score < 0.5)")
+                    print(f"      Evaluation Cost: ${results.get('evaluation_cost_usd', 0):.4f}")
+
                 print(f"   📊 Total processed: {processed_count} | Errors: {error_count}")
                 print()
 
@@ -138,9 +164,10 @@ async def run_evaluations(trace: RAGTrace) -> Dict[str, Any]:
     Currently implements:
     - Token overlap ratio (fast, no LLM needed)
     - Answer length (fast)
+    - Faithfulness score (RAGAS, uses OpenAI)
 
-    TODO (Day 4-5):
-    - RAGAS metrics (faithfulness, answer_relevancy, context_precision/recall)
+    TODO (Next phase):
+    - Answer relevancy, context precision/recall
     - Hallucination detection
     - PII detection
     - Toxicity scoring
@@ -168,25 +195,92 @@ async def run_evaluations(trace: RAGTrace) -> Dict[str, Any]:
     # 2. Answer length - simple word count
     results["answer_length"] = len(trace.response.split())
 
-    # 3. No evaluation cost yet (will add when using LLM-based metrics)
-    results["evaluation_cost_usd"] = 0.0
+    # 3. RAGAS Faithfulness Score (LLM-based, detects hallucinations)
+    if trace.contexts and len(trace.contexts) > 0:
+        try:
+            faithfulness_result = await compute_faithfulness(
+                query=trace.query,
+                answer=trace.response,
+                contexts=[ctx.get("text", "") for ctx in trace.contexts]
+            )
+            results["faithfulness"] = faithfulness_result["score"]
+            results["evaluation_cost_usd"] = faithfulness_result["cost"]
 
-    # TODO: Add RAGAS metrics
-    # from ragas.metrics import faithfulness, answer_relevancy
-    # from ragas import evaluate
-    # from datasets import Dataset
-    #
-    # data = {
-    #     "question": [trace.query],
-    #     "answer": [trace.response],
-    #     "contexts": [[c["text"] for c in trace.contexts]],
-    # }
-    # dataset = Dataset.from_dict(data)
-    # ragas_results = evaluate(dataset, metrics=[faithfulness, answer_relevancy])
-    # results["faithfulness"] = ragas_results["faithfulness"]
-    # results["answer_relevancy"] = ragas_results["answer_relevancy"]
+            # Mark as hallucination if faithfulness < 0.5
+            results["hallucination_detected"] = faithfulness_result["score"] < 0.5 if faithfulness_result["score"] is not None else False
+        except Exception as e:
+            print(f"   ⚠️  RAGAS faithfulness failed: {e}")
+            results["faithfulness"] = None
+            results["evaluation_cost_usd"] = 0.0
+            results["hallucination_detected"] = False
+    else:
+        # No contexts, can't compute faithfulness
+        results["faithfulness"] = None
+        results["evaluation_cost_usd"] = 0.0
+        results["hallucination_detected"] = False
 
     return results
+
+
+async def compute_faithfulness(query: str, answer: str, contexts: List[str]) -> Dict[str, Any]:
+    """
+    Compute faithfulness score using RAGAS.
+
+    Faithfulness measures whether the answer is grounded in the provided contexts.
+    Score ranges from 0.0 (completely unfaithful/hallucinated) to 1.0 (perfectly faithful).
+
+    Args:
+        query: The user's question
+        answer: The generated response
+        contexts: List of retrieved context texts
+
+    Returns:
+        Dictionary with 'score' and 'cost' keys
+    """
+    if not RAGAS_AVAILABLE:
+        return {"score": None, "cost": 0.0}
+
+    if not contexts or not answer:
+        return {"score": None, "cost": 0.0}
+
+    try:
+        # Prepare data in RAGAS format
+        data = {
+            "question": [query],
+            "answer": [answer],
+            "contexts": [contexts],  # RAGAS expects list of lists
+        }
+
+        # Create dataset
+        dataset = Dataset.from_dict(data)
+
+        # Run evaluation (this calls OpenAI API)
+        # Note: RAGAS uses OpenAI by default, configured via OPENAI_API_KEY env var
+        result = evaluate(dataset, metrics=[faithfulness])
+
+        # Extract faithfulness score
+        # RAGAS returns a dict with metric names as keys
+        # The value might be a single score or a list (if evaluating multiple items)
+        faithfulness_value = result["faithfulness"]
+        if isinstance(faithfulness_value, list):
+            faithfulness_score = float(faithfulness_value[0]) if faithfulness_value else None
+        else:
+            faithfulness_score = float(faithfulness_value)
+
+        # Estimate cost (OpenAI gpt-3.5-turbo pricing)
+        # Faithfulness typically uses ~500-1000 tokens per evaluation
+        # At $0.001/1K tokens for gpt-3.5-turbo
+        estimated_tokens = len(query.split()) + len(answer.split()) + sum(len(ctx.split()) for ctx in contexts)
+        estimated_cost = Decimal(estimated_tokens / 1000 * 0.001)
+
+        return {
+            "score": faithfulness_score,
+            "cost": float(estimated_cost)
+        }
+
+    except Exception as e:
+        print(f"      RAGAS faithfulness error: {str(e)}")
+        return {"score": None, "cost": 0.0}
 
 
 def calculate_token_overlap(response: str, contexts: List[str]) -> float:
