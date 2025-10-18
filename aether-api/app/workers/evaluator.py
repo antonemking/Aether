@@ -12,14 +12,16 @@ import json
 import asyncio
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from uuid import UUID
 from decimal import Decimal
 
 from app.core.database import SessionLocal
 from app.core.redis_client import get_redis
-from app.models import RAGTrace, Evaluation
+from app.models import RAGTrace, Evaluation, Alert, AlertType, Severity, AlertConfig, Project
+from app.services.slack_service import SlackService
+from app.services.metrics_service import MetricsService
 
 # RAGAS imports
 try:
@@ -129,6 +131,9 @@ async def process_evaluation_queue():
                     if results.get('hallucination_detected'):
                         print(f"      ⚠️  HALLUCINATION DETECTED (score < 0.5)")
                     print(f"      Evaluation Cost: ${results.get('evaluation_cost_usd', 0):.4f}")
+
+                # Check for alerts and send to Slack
+                await check_and_send_alerts(db, trace, evaluation, results)
 
                 print(f"   📊 Total processed: {processed_count} | Errors: {error_count}")
                 print()
@@ -315,6 +320,152 @@ def calculate_token_overlap(response: str, contexts: List[str]) -> float:
     overlap = len(response_tokens & context_tokens)
 
     return overlap / len(response_tokens)
+
+
+async def check_and_send_alerts(db, trace: RAGTrace, evaluation: Evaluation, results: Dict[str, Any]):
+    """
+    Check if any alert conditions are met and send alerts to Slack.
+
+    Args:
+        db: Database session
+        trace: RAGTrace instance
+        evaluation: Evaluation instance
+        results: Dictionary of evaluation results
+    """
+    try:
+        # Load project and alert config
+        project = db.query(Project).filter(Project.id == trace.project_id).first()
+        if not project:
+            return
+
+        alert_config = db.query(AlertConfig).filter(AlertConfig.project_id == project.id).first()
+        if not alert_config or not alert_config.slack_enabled or not alert_config.slack_webhook_url:
+            return  # No Slack configured for this project
+
+        # 1. Check for hallucination alert
+        if (alert_config.hallucination_alerts_enabled and
+            results.get('hallucination_detected') and
+            results.get('faithfulness') is not None):
+
+            print(f"   📤 Sending hallucination alert to Slack...")
+
+            # Create alert record
+            alert = Alert(
+                project_id=project.id,
+                alert_type=AlertType.HALLUCINATION,
+                severity=Severity.CRITICAL,
+                message=f"Hallucination detected with faithfulness score {results['faithfulness']:.2f}",
+                alert_metadata={
+                    "trace_id": str(trace.id),
+                    "evaluation_id": str(evaluation.id),
+                    "faithfulness_score": results['faithfulness'],
+                    "threshold": alert_config.hallucination_threshold,
+                    "query": trace.query[:200],
+                    "response": trace.response[:300]
+                }
+            )
+            db.add(alert)
+            db.commit()
+
+            # Send to Slack
+            success = await SlackService.send_hallucination_alert(
+                webhook_url=alert_config.slack_webhook_url,
+                project_name=project.name,
+                trace_id=str(trace.id),
+                query=trace.query,
+                response=trace.response,
+                faithfulness_score=results['faithfulness'],
+                threshold=alert_config.hallucination_threshold
+            )
+
+            if success:
+                print(f"   ✅ Hallucination alert sent to Slack")
+            else:
+                print(f"   ⚠️  Failed to send hallucination alert")
+
+        # 2. Check for cost spike alert
+        if alert_config.cost_spike_alerts_enabled and alert_config.daily_cost_budget_usd:
+            daily_cost = MetricsService.get_daily_cost(db, str(project.id))
+
+            if daily_cost > alert_config.daily_cost_budget_usd:
+                # Check if we already sent an alert today to avoid spam
+                recent_cost_alert = db.query(Alert).filter(
+                    Alert.project_id == project.id,
+                    Alert.alert_type == AlertType.COST_SPIKE,
+                    Alert.created_at >= datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                ).first()
+
+                if not recent_cost_alert:
+                    print(f"   📤 Sending cost spike alert to Slack...")
+
+                    alert = Alert(
+                        project_id=project.id,
+                        alert_type=AlertType.COST_SPIKE,
+                        severity=Severity.WARNING,
+                        message=f"Daily cost ${daily_cost:.4f} exceeded budget ${alert_config.daily_cost_budget_usd:.4f}",
+                        alert_metadata={
+                            "daily_cost": daily_cost,
+                            "budget": alert_config.daily_cost_budget_usd,
+                            "overage_pct": ((daily_cost - alert_config.daily_cost_budget_usd) / alert_config.daily_cost_budget_usd) * 100
+                        }
+                    )
+                    db.add(alert)
+                    db.commit()
+
+                    success = await SlackService.send_cost_spike_alert(
+                        webhook_url=alert_config.slack_webhook_url,
+                        project_name=project.name,
+                        current_cost=daily_cost,
+                        budget=alert_config.daily_cost_budget_usd
+                    )
+
+                    if success:
+                        print(f"   ✅ Cost spike alert sent to Slack")
+                    else:
+                        print(f"   ⚠️  Failed to send cost spike alert")
+
+        # 3. Check for latency alert
+        if alert_config.latency_alerts_enabled and alert_config.latency_p95_threshold_ms:
+            p95_latency = MetricsService.get_p95_latency(db, str(project.id), hours=1)
+
+            if p95_latency and p95_latency > alert_config.latency_p95_threshold_ms:
+                # Check if we already sent an alert in the last hour to avoid spam
+                recent_latency_alert = db.query(Alert).filter(
+                    Alert.project_id == project.id,
+                    Alert.alert_type == AlertType.HIGH_LATENCY,
+                    Alert.created_at >= datetime.utcnow() - timedelta(hours=1)
+                ).first()
+
+                if not recent_latency_alert:
+                    print(f"   📤 Sending high latency alert to Slack...")
+
+                    alert = Alert(
+                        project_id=project.id,
+                        alert_type=AlertType.HIGH_LATENCY,
+                        severity=Severity.WARNING,
+                        message=f"P95 latency {p95_latency:.0f}ms exceeded threshold {alert_config.latency_p95_threshold_ms}ms",
+                        alert_metadata={
+                            "p95_latency": p95_latency,
+                            "threshold": alert_config.latency_p95_threshold_ms
+                        }
+                    )
+                    db.add(alert)
+                    db.commit()
+
+                    success = await SlackService.send_latency_alert(
+                        webhook_url=alert_config.slack_webhook_url,
+                        project_name=project.name,
+                        p95_latency=p95_latency,
+                        threshold=alert_config.latency_p95_threshold_ms
+                    )
+
+                    if success:
+                        print(f"   ✅ Latency alert sent to Slack")
+                    else:
+                        print(f"   ⚠️  Failed to send latency alert")
+
+    except Exception as e:
+        print(f"   ⚠️  Error checking/sending alerts: {e}")
 
 
 if __name__ == "__main__":

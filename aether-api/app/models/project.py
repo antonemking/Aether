@@ -34,3 +34,4 @@ class Project(Base):
     organization = relationship("Organization", back_populates="projects")
     traces = relationship("RAGTrace", back_populates="project", cascade="all, delete-orphan")
     alerts = relationship("Alert", back_populates="project", cascade="all, delete-orphan")
+    alert_config = relationship("AlertConfig", back_populates="project", uselist=False, cascade="all, delete-orphan")

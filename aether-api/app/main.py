@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from app.core.config import settings
 from app.core.redis_client import get_redis, close_redis
-from app.api.v1 import health, traces, projects, auth
+from app.api.v1 import health, traces, projects, auth, alerts, alert_config
 
 
 @asynccontextmanager
@@ -38,6 +38,8 @@ app.include_router(health.router, tags=["health"])
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(projects.router, prefix="/api/v1/projects", tags=["projects"])
 app.include_router(traces.router, prefix="/api/v1/traces", tags=["traces"])
+app.include_router(alerts.router, prefix="/api/v1/alerts", tags=["alerts"])
+app.include_router(alert_config.router, prefix="/api/v1/alert-config", tags=["alert-config"])
 
 
 @app.get("/")
